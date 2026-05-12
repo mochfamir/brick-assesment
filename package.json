@@ -1,0 +1,24 @@
+{
+  "name": "brick-assesment",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/scrape.js",
+  "scripts": {
+    "scrape": "node src/scrape.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mochfamir/brick-assesment.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/mochfamir/brick-assesment/issues"
+  },
+  "homepage": "https://github.com/mochfamir/brick-assesment#readme",
+  "description": "",
+  "dependencies": {
+    "puppeteer": "^24.43.1"
+  }
+}
