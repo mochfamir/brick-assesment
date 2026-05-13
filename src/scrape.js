@@ -1,10 +1,48 @@
 import fs from "node:fs";
+import { load } from "cheerio";
 import puppeteer from "puppeteer";
 
 const DEFAULT_MAX = 100;
 const DEFAULT_CATEGORY_SEGMENT = "handphone-tablet/handphone";
 const DEFAULT_CATEGORY_URL = `https://www.tokopedia.com/p/${DEFAULT_CATEGORY_SEGMENT}`;
 const RATING_SCALE = 5;
+
+function parseTokopediaPriceToInt(priceDisplay) {
+  if (priceDisplay == null) return null;
+  if (typeof priceDisplay === "number" && Number.isFinite(priceDisplay)) {
+    return Math.round(priceDisplay);
+  }
+  const s = String(priceDisplay)
+    .replace(/^rp\s*/i, "")
+    .replace(/\s/g, "")
+    .trim();
+  if (!s) return null;
+  const digitsOnly = s.replace(/\./g, "").replace(/,/g, "");
+  const n = Number.parseInt(digitsOnly, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** `rating` as "4.5/5" or "5/5"; `price` as integer Rupiah. */
+function finalizeProductDetail(part) {
+  const outOf = part.ratingOutOf ?? RATING_SCALE;
+  const price = parseTokopediaPriceToInt(part.price);
+
+  let rating = null;
+  if (part.rating != null && Number.isFinite(Number(part.rating))) {
+    const r = Number(part.rating);
+    const left = Number.isInteger(r) ? String(r) : String(r);
+    rating = `${left}/${outOf}`;
+  }
+
+  return {
+    name: part.name ?? null,
+    description: part.description ?? null,
+    imageLink: part.imageLink ?? null,
+    price,
+    rating,
+    merchantName: part.merchantName ?? null,
+  };
+}
 
 const chromeUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -21,6 +59,8 @@ Options:
   --show-detail[=true|false] After listing URLs, open each PDP and scrape name, description,
                             image, price, rating (/5), merchant (default: false)
   -j, --concurrency <n>     Parallel PDP tabs when --show-detail (default: 4, max: 8)
+  --cheerio[=true|false]   With --show-detail, fetch PDP HTML and parse with Cheerio
+                            (faster; needs SSR/markup in response — else fields may be empty)
   --format <json|csv>      stdout format (default: json). Shorthand: --csv
   -o, --out <path>         Write result to this file as UTF-8 (recommended on Windows
                             instead of PowerShell ">" which may use UTF-16 and break CSV in Excel)
@@ -61,6 +101,23 @@ function parseShowDetail(argv) {
     }
     if (a.startsWith("--show-detail=")) {
       const v = a.slice("--show-detail=".length).trim().toLowerCase();
+      return v === "true" || v === "1";
+    }
+  }
+  return false;
+}
+
+function parseCheerio(argv) {
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--cheerio") {
+      const next = argv[i + 1];
+      if (next === "false" || next === "0") return false;
+      if (next === "true" || next === "1") return true;
+      return true;
+    }
+    if (a.startsWith("--cheerio=")) {
+      const v = a.slice("--cheerio=".length).trim().toLowerCase();
       return v === "true" || v === "1";
     }
   }
@@ -128,6 +185,21 @@ function parseCli() {
     if (a.startsWith("--show-detail=")) {
       continue;
     }
+    if (a === "--cheerio") {
+      const next = argv[i + 1];
+      if (
+        next === "true" ||
+        next === "false" ||
+        next === "1" ||
+        next === "0"
+      ) {
+        i += 1;
+      }
+      continue;
+    }
+    if (a.startsWith("--cheerio=")) {
+      continue;
+    }
   }
 
   const maxProducts =
@@ -154,6 +226,8 @@ function parseCli() {
   const rawFmt = (formatArg || envFmt || "json").trim().toLowerCase();
   const outputFormat = rawFmt === "csv" ? "csv" : "json";
 
+  const useCheerio = parseCheerio(argv);
+
   return {
     maxProducts,
     categoryUrl,
@@ -161,6 +235,7 @@ function parseCli() {
     detailConcurrency,
     outputFormat,
     outPath: outPath || null,
+    useCheerio,
   };
 }
 
@@ -171,6 +246,7 @@ const {
   detailConcurrency: DETAIL_CONCURRENCY,
   outputFormat: OUTPUT_FORMAT,
   outPath: OUTPUT_PATH,
+  useCheerio: USE_CHEERIO,
 } = parseCli();
 
 /** RFC-style CSV cell; UTF-8 BOM added at document level for Excel. */
@@ -330,6 +406,123 @@ async function attachDetailPageOptimizations(page) {
   });
 }
 
+function normDetailText(s) {
+  return (s ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** Same selectors as browser evaluate; works when PDP HTML contains markup (SSR/hydration shell). */
+function parseProductDetailFromHtml(html) {
+  const $ = load(html);
+  const text = (sel) => normDetailText($(sel).first().text());
+
+  const name =
+    text('[data-testid="lblPDPDetailProductName"]') ||
+    normDetailText($("#pdp_comp-product_content h1").first().text());
+
+  const price = text('[data-testid="lblPDPDetailProductPrice"]');
+
+  const ratingRaw = text('[data-testid="lblPDPDetailProductRatingNumber"]');
+  let rating = null;
+  if (ratingRaw) {
+    const n = Number.parseFloat(ratingRaw.replace(",", "."));
+    rating = Number.isFinite(n) ? n : null;
+  }
+
+  const description =
+    text('[data-testid="lblPDPDescriptionProduk"]') ||
+    text('[data-testid="lblPDPDescription"]') ||
+    text('[data-testid="pdpProductDescription"]') ||
+    normDetailText($("#pdp_comp-product_detail_desk").first().text()) ||
+    normDetailText($("#pdp_comp-ldp").first().text()) ||
+    "";
+
+  let img = $("#pdp_comp-product_main_media img").first();
+  if (!img.length) img = $('[data-testid="PDPImagePrimary"] img').first();
+  if (!img.length) img = $("#pdp_comp-product_content img").first();
+
+  const imageLink =
+    img.attr("src") ||
+    img.attr("data-src") ||
+    $('meta[property="og:image"]').attr("content") ||
+    null;
+
+  const merchantName =
+    text('[data-testid="llbPDPFooterShopName"]') ||
+    text('[data-testid="lblPDPShopName"]') ||
+    text('a[data-testid="lnkSellerName"]') ||
+    text('[data-testid="pdpShopName"]') ||
+    text('[data-testid="llsPDPShopName"]') ||
+    text('[data-testid="lblPDPShopMerchantName"]') ||
+    null;
+
+  return finalizeProductDetail({
+    name: name || null,
+    description: description || null,
+    imageLink: imageLink || null,
+    price,
+    rating,
+    ratingOutOf: RATING_SCALE,
+    merchantName,
+  });
+}
+
+async function fetchPdpHtml(productUrl) {
+  const res = await fetch(productUrl, {
+    redirect: "follow",
+    headers: {
+      "user-agent": chromeUserAgent,
+      accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} for ${productUrl}`);
+  }
+  return res.text();
+}
+
+async function scrapeOneProductDetailCheerio(productUrl) {
+  try {
+    const html = await fetchPdpHtml(productUrl);
+    return parseProductDetailFromHtml(html);
+  } catch {
+    return finalizeProductDetail({
+      name: null,
+      description: null,
+      imageLink: null,
+      price: null,
+      rating: null,
+      ratingOutOf: RATING_SCALE,
+      merchantName: null,
+    });
+  }
+}
+
+async function enrichWithProductDetailsCheerio(urls, concurrency) {
+  const results = new Array(urls.length);
+  let cursor = 0;
+
+  function claimIndex() {
+    if (cursor >= urls.length) return -1;
+    return cursor++;
+  }
+
+  async function worker() {
+    for (;;) {
+      const i = claimIndex();
+      if (i < 0) break;
+      const url = urls[i];
+      const detail = await scrapeOneProductDetailCheerio(url);
+      results[i] = { url, detail };
+    }
+  }
+
+  const workers = Math.min(concurrency, Math.max(1, urls.length));
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
+}
+
 async function scrapeOneProductDetail(page, productUrl) {
   await page.goto(productUrl, {
     waitUntil: "domcontentloaded",
@@ -346,7 +539,7 @@ async function scrapeOneProductDetail(page, productUrl) {
     })
     .catch(() => {});
 
-  const detail = await page.evaluate((ratingScale) => {
+  const detail = await page.evaluate(() => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
     const text = (sel) => norm(document.querySelector(sel)?.textContent);
 
@@ -398,12 +591,11 @@ async function scrapeOneProductDetail(page, productUrl) {
       imageLink: imageLink || null,
       price: price || null,
       rating,
-      ratingOutOf: ratingScale,
       merchantName,
     };
-  }, RATING_SCALE);
+  });
 
-  return detail;
+  return finalizeProductDetail({ ...detail, ratingOutOf: RATING_SCALE });
 }
 
 async function enrichWithProductDetails(browser, urls, concurrency) {
@@ -448,7 +640,6 @@ function printResult(payload) {
         "imageLink",
         "price",
         "rating",
-        "ratingOutOf",
         "merchantName",
       ];
       const rows = [header];
@@ -460,7 +651,6 @@ function printResult(payload) {
           detail.imageLink,
           detail.price,
           detail.rating,
-          detail.ratingOutOf,
           detail.merchantName,
         ]);
       }
@@ -476,7 +666,7 @@ function printResult(payload) {
 }
 
 async function main() {
-  const browser = await puppeteer.launch({
+  let browser = await puppeteer.launch({
     headless: true,
     args: ["--disable-http2"],
   });
@@ -484,22 +674,7 @@ async function main() {
   try {
     const { urls, pagesOpened } = await scrapeTopProductUrls(browser);
 
-    if (SHOW_DETAIL) {
-      const products = await enrichWithProductDetails(
-        browser,
-        urls,
-        DETAIL_CONCURRENCY,
-      );
-      printResult({
-        categoryUrl,
-        maxProducts: MAX_PRODUCTS,
-        count: urls.length,
-        pagesOpened,
-        showDetail: true,
-        detailConcurrency: DETAIL_CONCURRENCY,
-        products,
-      });
-    } else {
+    if (!SHOW_DETAIL) {
       printResult({
         categoryUrl,
         maxProducts: MAX_PRODUCTS,
@@ -508,9 +683,41 @@ async function main() {
         showDetail: false,
         productUrls: urls,
       });
+      return;
     }
+
+    let products;
+    let detailEngine;
+
+    if (USE_CHEERIO) {
+      await browser.close();
+      browser = null;
+      products = await enrichWithProductDetailsCheerio(
+        urls,
+        DETAIL_CONCURRENCY,
+      );
+      detailEngine = "cheerio";
+    } else {
+      products = await enrichWithProductDetails(
+        browser,
+        urls,
+        DETAIL_CONCURRENCY,
+      );
+      detailEngine = "puppeteer";
+    }
+
+    printResult({
+      categoryUrl,
+      maxProducts: MAX_PRODUCTS,
+      count: urls.length,
+      pagesOpened,
+      showDetail: true,
+      detailConcurrency: DETAIL_CONCURRENCY,
+      detailEngine,
+      products,
+    });
   } finally {
-    await browser.close();
+    if (browser) await browser.close();
   }
 }
 
