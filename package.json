@@ -5,7 +5,7 @@
   "main": "src/scrape.js",
   "scripts": {
     "scrape": "node src/scrape.js",
-    "scrape:handphone": "node src/scrape.js -n 100 --show-detail=true -c handphone-tablet/handphone -o output.json",
+    "scrape:handphone": "node src/scrape.js -n 100 --show-detail=true -c handphone-tablet/handphone -o output.json --cheerio",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
