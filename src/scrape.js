@@ -1,4 +1,7 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { load } from "cheerio";
 import puppeteer from "puppeteer";
 
@@ -22,7 +25,6 @@ function parseTokopediaPriceToInt(priceDisplay) {
   return Number.isFinite(n) ? n : null;
 }
 
-/** `rating` as "4.5/5" or "5/5"; `price` as integer Rupiah. */
 function finalizeProductDetail(part) {
   const outOf = part.ratingOutOf ?? RATING_SCALE;
   const price = parseTokopediaPriceToInt(part.price);
@@ -249,7 +251,63 @@ const {
   useCheerio: USE_CHEERIO,
 } = parseCli();
 
-/** RFC-style CSV cell; UTF-8 BOM added at document level for Excel. */
+const SCRAPE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PDP_DEBUG_ASSETS_DIR = path.join(SCRAPE_DIR, "..", "assets");
+
+function pdpDebugSinglePath(engine) {
+  const name =
+    engine === "cheerio"
+      ? "pdp-debug-cheerio.html"
+      : "pdp-debug-puppeteer.html";
+  return path.join(PDP_DEBUG_ASSETS_DIR, name);
+}
+
+/** One file per URL so parallel workers do not clobber each other. */
+function pdpDebugMissingPath(engine, productUrl) {
+  const h = crypto.createHash("sha256").update(productUrl).digest("hex").slice(0, 16);
+  const stem =
+    engine === "cheerio"
+      ? "pdp-debug-cheerio-missing"
+      : "pdp-debug-puppeteer-missing";
+  return path.join(PDP_DEBUG_ASSETS_DIR, `${stem}-${h}.html`);
+}
+
+function detailMissingRatingOrShop(detail) {
+  const noRating =
+    detail.rating == null || String(detail.rating).trim() === "";
+  const noShop =
+    detail.merchantName == null ||
+    String(detail.merchantName).trim() === "";
+  return noRating || noShop;
+}
+
+function writePdpDebugFile(outFile, html, logLabel) {
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  fs.writeFileSync(outFile, html, { encoding: "utf8" });
+  console.error(`Wrote PDP debug HTML (${logLabel}): ${outFile}`);
+}
+
+function maybeWritePdpDebugSingle(engine, html) {
+  if (MAX_PRODUCTS !== 1) return;
+  writePdpDebugFile(pdpDebugSinglePath(engine), html, `${engine} -n1`);
+}
+
+function maybeWritePdpDebugMissing(engine, productUrl, html, detail) {
+  if (!detailMissingRatingOrShop(detail)) return;
+  writePdpDebugFile(
+    pdpDebugMissingPath(engine, productUrl),
+    html,
+    `${engine} missing rating/shop`,
+  );
+}
+
+/** stderr progress when scraping multiple PDPs (`-n` > 1). */
+function logPdpProgress(ordinal, total, url, engine) {
+  if (total <= 1) return;
+  const label = engine === "cheerio" ? "cheerio" : "puppeteer";
+  console.error(`[PDP ${ordinal}/${total}] (${label})`);
+}
+
 function csvCell(value) {
   if (value === null || value === undefined) return "";
   const s = String(value);
@@ -388,7 +446,6 @@ const BLOCK_URL_PARTS = [
   "branch.io",
 ];
 
-/** PDP-only: skip heavy assets so HTML/JSON still hydrates but loads faster. */
 async function attachDetailPageOptimizations(page) {
   await page.setRequestInterception(true);
   page.on("request", (req) => {
@@ -410,7 +467,23 @@ function normDetailText(s) {
   return (s ?? "").replace(/\s+/g, " ").trim();
 }
 
-/** Same selectors as browser evaluate; works when PDP HTML contains markup (SSR/hydration shell). */
+function parsePdpStatsRatingFromHtml(html) {
+  const m = html.match(
+    /"countTalk":"[^"]*","rating":([0-9]+(?:\.[0-9]+)?),"__typename":"pdpStats"/,
+  );
+  if (!m) return null;
+  const n = Number.parseFloat(m[1].replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function parsePdpBasicInfoShopNameFromHtml(html) {
+  let m = html.match(/"shopID":"[^"]*","shopName":"([^"]*)"/);
+  if (m?.[1]?.trim()) return m[1].trim();
+  m = html.match(/"shopName":"([^"]*)","minOrder":/);
+  if (m?.[1]?.trim()) return m[1].trim();
+  return null;
+}
+
 function parseProductDetailFromHtml(html) {
   const $ = load(html);
   const text = (sel) => normDetailText($(sel).first().text());
@@ -426,6 +499,9 @@ function parseProductDetailFromHtml(html) {
   if (ratingRaw) {
     const n = Number.parseFloat(ratingRaw.replace(",", "."));
     rating = Number.isFinite(n) ? n : null;
+  }
+  if (rating == null) {
+    rating = parsePdpStatsRatingFromHtml(html);
   }
 
   const description =
@@ -453,6 +529,7 @@ function parseProductDetailFromHtml(html) {
     text('[data-testid="pdpShopName"]') ||
     text('[data-testid="llsPDPShopName"]') ||
     text('[data-testid="lblPDPShopMerchantName"]') ||
+    parsePdpBasicInfoShopNameFromHtml(html) ||
     null;
 
   return finalizeProductDetail({
@@ -485,7 +562,10 @@ async function fetchPdpHtml(productUrl) {
 async function scrapeOneProductDetailCheerio(productUrl) {
   try {
     const html = await fetchPdpHtml(productUrl);
-    return parseProductDetailFromHtml(html);
+    const detail = parseProductDetailFromHtml(html);
+    maybeWritePdpDebugSingle("cheerio", html);
+    maybeWritePdpDebugMissing("cheerio", productUrl, html, detail);
+    return detail;
   } catch {
     return finalizeProductDetail({
       name: null,
@@ -513,6 +593,7 @@ async function enrichWithProductDetailsCheerio(urls, concurrency) {
       const i = claimIndex();
       if (i < 0) break;
       const url = urls[i];
+      logPdpProgress(i + 1, urls.length, url, "cheerio");
       const detail = await scrapeOneProductDetailCheerio(url);
       results[i] = { url, detail };
     }
@@ -539,13 +620,42 @@ async function scrapeOneProductDetail(page, productUrl) {
     })
     .catch(() => {});
 
+  await page
+    .waitForSelector('[data-testid="lblPDPDetailProductRatingNumber"]', {
+      timeout: 12_000,
+    })
+    .catch(() => {});
+
   const detail = await page.evaluate(() => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-    const text = (sel) => norm(document.querySelector(sel)?.textContent);
+
+    function querySelectorDeep(root, selector) {
+      if (!root?.querySelector) return null;
+      try {
+        const hit = root.querySelector(selector);
+        if (hit) return hit;
+      } catch {
+        return null;
+      }
+      for (const node of root.querySelectorAll("*")) {
+        if (node.shadowRoot) {
+          const found = querySelectorDeep(node.shadowRoot, selector);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+
+    const text = (sel) => norm(querySelectorDeep(document, sel)?.textContent);
 
     const name =
       text('[data-testid="lblPDPDetailProductName"]') ||
-      text("#pdp_comp-product_content h1");
+      norm(
+        querySelectorDeep(
+          document,
+          "#pdp_comp-product_content h1",
+        )?.textContent,
+      );
 
     const price = text('[data-testid="lblPDPDetailProductPrice"]');
 
@@ -565,9 +675,9 @@ async function scrapeOneProductDetail(page, productUrl) {
       "";
 
     const imgEl =
-      document.querySelector("#pdp_comp-product_main_media img") ||
-      document.querySelector('[data-testid="PDPImagePrimary"] img') ||
-      document.querySelector("#pdp_comp-product_content img");
+      querySelectorDeep(document, "#pdp_comp-product_main_media img") ||
+      querySelectorDeep(document, '[data-testid="PDPImagePrimary"] img') ||
+      querySelectorDeep(document, "#pdp_comp-product_content img");
     const imageLink =
       imgEl?.getAttribute("src") ||
       imgEl?.getAttribute("data-src") ||
@@ -595,7 +705,35 @@ async function scrapeOneProductDetail(page, productUrl) {
     };
   });
 
-  return finalizeProductDetail({ ...detail, ratingOutOf: RATING_SCALE });
+  let detailForFinalize = { ...detail };
+  let htmlSnapshot = null;
+  const needScriptFallback =
+    detailForFinalize.rating == null ||
+    !String(detailForFinalize.merchantName ?? "").trim();
+  if (needScriptFallback) {
+    htmlSnapshot = await page.content();
+    if (detailForFinalize.rating == null) {
+      const r = parsePdpStatsRatingFromHtml(htmlSnapshot);
+      if (r != null) detailForFinalize.rating = r;
+    }
+    if (!String(detailForFinalize.merchantName ?? "").trim()) {
+      const s = parsePdpBasicInfoShopNameFromHtml(htmlSnapshot);
+      if (s) detailForFinalize.merchantName = s;
+    }
+  }
+
+  const finalized = finalizeProductDetail({
+    ...detailForFinalize,
+    ratingOutOf: RATING_SCALE,
+  });
+
+  if (MAX_PRODUCTS === 1 || detailMissingRatingOrShop(finalized)) {
+    const html = htmlSnapshot ?? (await page.content());
+    maybeWritePdpDebugSingle("puppeteer", html);
+    maybeWritePdpDebugMissing("puppeteer", productUrl, html, finalized);
+  }
+
+  return finalized;
 }
 
 async function enrichWithProductDetails(browser, urls, concurrency) {
@@ -617,6 +755,7 @@ async function enrichWithProductDetails(browser, urls, concurrency) {
         const i = claimIndex();
         if (i < 0) break;
         const url = urls[i];
+        logPdpProgress(i + 1, urls.length, url, "puppeteer");
         const detail = await scrapeOneProductDetail(page, url);
         results[i] = { url, detail };
       }
