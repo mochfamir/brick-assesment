@@ -355,18 +355,69 @@ function productUrlWithoutQuery(href) {
   }
 }
 
-async function nudgeListScroll(page) {
-  await page.evaluate(() => {
-    const root = document.querySelector('[data-testid="lstCL2ProductList"]');
-    if (root) root.scrollIntoView({ block: "start", behavior: "instant" });
-    window.scrollBy({ top: 480, left: 0, behavior: "instant" });
-  });
-  await new Promise((r) => setTimeout(r, 650));
+/**
+ * Tokopedia PLP lazy-loads cards; a single nudge often leaves ~60 nodes.
+ * Reset scroll to top (important after ?page=2+), then scroll until link count stabilizes.
+ */
+async function scrollListingToLoadLazyRows(page) {
+  await page.waitForSelector(LIST_ROOT, { timeout: 60_000 });
+
+  await page.evaluate((listSel) => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+    const root = document.querySelector(listSel);
+    if (root) {
+      root.scrollTop = 0;
+      root.scrollIntoView({ block: "start", behavior: "instant" });
+    }
+  }, LIST_ROOT);
+  await new Promise((r) => setTimeout(r, 400));
+
+  let lastCount = -1;
+  let stablePasses = 0;
+  const maxPasses = 50;
+  const stableNeeded = 4;
+  const pauseMs = 450;
+
+  for (let pass = 0; pass < maxPasses; pass++) {
+    const count = await page.evaluate((listSel, linkSel) => {
+      const root = document.querySelector(listSel);
+      if (!root) return 0;
+      return root.querySelectorAll(linkSel).length;
+    }, LIST_ROOT, PRODUCT_LINK);
+
+    if (count === lastCount) {
+      if (count > 0) stablePasses += 1;
+    } else {
+      stablePasses = 0;
+      lastCount = count;
+    }
+    if (stablePasses >= stableNeeded) break;
+
+    await page.evaluate((listSel) => {
+      const step = Math.floor(window.innerHeight * 0.9);
+      window.scrollBy({ top: step, left: 0, behavior: "instant" });
+      const root = document.querySelector(listSel);
+      if (root) {
+        const next = Math.min(root.scrollHeight, root.scrollTop + step);
+        root.scrollTop = next;
+      }
+      const nearBottom =
+        window.scrollY + window.innerHeight >=
+        document.documentElement.scrollHeight - 80;
+      if (nearBottom) {
+        window.scrollTo({
+          top: document.documentElement.scrollHeight,
+          behavior: "instant",
+        });
+      }
+      if (root) root.scrollTop = root.scrollHeight;
+    }, LIST_ROOT);
+    await new Promise((r) => setTimeout(r, pauseMs));
+  }
 }
 
 async function collectHrefsFromListPage(page) {
-  await page.waitForSelector(LIST_ROOT, { timeout: 60_000 });
-  await nudgeListScroll(page);
+  await scrollListingToLoadLazyRows(page);
 
   return page.evaluate((listSel, linkSel) => {
     const root = document.querySelector(listSel);
@@ -399,6 +450,7 @@ async function scrapeTopProductUrls(browser) {
       const target = listingUrlForPage(categoryUrl, listPage);
       await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 });
       pagesOpened += 1;
+      await new Promise((r) => setTimeout(r, 400));
 
       const batch = await collectHrefsFromListPage(page);
       let addedThisRound = 0;
