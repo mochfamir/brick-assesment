@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import puppeteer from "puppeteer";
 
 const DEFAULT_MAX = 100;
@@ -19,11 +20,17 @@ Options:
   -c, --category <path>     Category path or full listing URL (default: /${DEFAULT_CATEGORY_SEGMENT})
   --show-detail[=true|false] After listing URLs, open each PDP and scrape name, description,
                             image, price, rating (/5), merchant (default: false)
+  -j, --concurrency <n>     Parallel PDP tabs when --show-detail (default: 4, max: 8)
+  --format <json|csv>      stdout format (default: json). Shorthand: --csv
+  -o, --out <path>         Write result to this file as UTF-8 (recommended on Windows
+                            instead of PowerShell ">" which may use UTF-16 and break CSV in Excel)
   -h, --help                Show this message
 
 Environment (optional overrides):
   SCRAPE_MAX_PRODUCTS       Same as --num
   SCRAPE_URL                Full category URL (used when --category is omitted)
+  SCRAPE_CONCURRENCY        Same as --concurrency
+  SCRAPE_FORMAT             json or csv (same as --format)
 `);
 }
 
@@ -64,6 +71,9 @@ function parseCli() {
   const argv = process.argv;
   let num = null;
   let category = null;
+  let concurrency = null;
+  let formatArg = null;
+  let outPath = null;
 
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
@@ -77,6 +87,30 @@ function parseCli() {
     }
     if (a === "--category" || a === "-c") {
       category = argv[++i] ?? "";
+      continue;
+    }
+    if (a === "--concurrency" || a === "-j") {
+      concurrency = Number.parseInt(argv[++i] ?? "", 10);
+      continue;
+    }
+    if (a === "--format") {
+      formatArg = (argv[++i] ?? "").trim().toLowerCase();
+      continue;
+    }
+    if (a.startsWith("--format=")) {
+      formatArg = a.slice("--format=".length).trim().toLowerCase();
+      continue;
+    }
+    if (a === "--csv") {
+      formatArg = "csv";
+      continue;
+    }
+    if (a === "--out" || a === "-o") {
+      outPath = (argv[++i] ?? "").trim();
+      continue;
+    }
+    if (a.startsWith("--out=")) {
+      outPath = a.slice("--out=".length).trim();
       continue;
     }
     if (a === "--show-detail") {
@@ -108,11 +142,57 @@ function parseCli() {
 
   const showDetail = parseShowDetail(argv);
 
-  return { maxProducts, categoryUrl, showDetail };
+  const rawConc =
+    (Number.isFinite(concurrency) && concurrency > 0 ? concurrency : null) ??
+    Number.parseInt(process.env.SCRAPE_CONCURRENCY ?? "", 10);
+  const detailConcurrency = Math.min(
+    8,
+    Math.max(1, Number.isFinite(rawConc) && rawConc > 0 ? rawConc : 4),
+  );
+
+  const envFmt = (process.env.SCRAPE_FORMAT ?? "").trim().toLowerCase();
+  const rawFmt = (formatArg || envFmt || "json").trim().toLowerCase();
+  const outputFormat = rawFmt === "csv" ? "csv" : "json";
+
+  return {
+    maxProducts,
+    categoryUrl,
+    showDetail,
+    detailConcurrency,
+    outputFormat,
+    outPath: outPath || null,
+  };
 }
 
-const { maxProducts: MAX_PRODUCTS, categoryUrl, showDetail: SHOW_DETAIL } =
-  parseCli();
+const {
+  maxProducts: MAX_PRODUCTS,
+  categoryUrl,
+  showDetail: SHOW_DETAIL,
+  detailConcurrency: DETAIL_CONCURRENCY,
+  outputFormat: OUTPUT_FORMAT,
+  outPath: OUTPUT_PATH,
+} = parseCli();
+
+/** RFC-style CSV cell; UTF-8 BOM added at document level for Excel. */
+function csvCell(value) {
+  if (value === null || value === undefined) return "";
+  const s = String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function toCsvLines(rows) {
+  return rows.map((cells) => cells.map(csvCell).join(",")).join("\r\n");
+}
+
+function writeOutput(text) {
+  if (OUTPUT_PATH) {
+    fs.writeFileSync(OUTPUT_PATH, text, { encoding: "utf8" });
+    console.error(`Wrote ${OUTPUT_PATH}`);
+    return;
+  }
+  process.stdout.write(text);
+}
 
 function listingUrlForPage(baseHref, pageNum) {
   const u = new URL(baseHref);
@@ -147,7 +227,7 @@ async function nudgeListScroll(page) {
     if (root) root.scrollIntoView({ block: "start", behavior: "instant" });
     window.scrollBy({ top: 480, left: 0, behavior: "instant" });
   });
-  await new Promise((r) => setTimeout(r, 1200));
+  await new Promise((r) => setTimeout(r, 650));
 }
 
 async function collectHrefsFromListPage(page) {
@@ -218,7 +298,36 @@ async function nudgePdpScroll(page) {
     window.scrollBy({ top: 420, left: 0, behavior: "instant" });
     window.scrollBy({ top: 900, left: 0, behavior: "instant" });
   });
-  await new Promise((r) => setTimeout(r, 900));
+  await new Promise((r) => setTimeout(r, 350));
+}
+
+const BLOCK_URL_PARTS = [
+  "googletagmanager.com",
+  "google-analytics.com",
+  "doubleclick.net",
+  "facebook.net",
+  "hotjar.com",
+  "tiktok.com",
+  "clarity.ms",
+  "branch.io",
+];
+
+/** PDP-only: skip heavy assets so HTML/JSON still hydrates but loads faster. */
+async function attachDetailPageOptimizations(page) {
+  await page.setRequestInterception(true);
+  page.on("request", (req) => {
+    const type = req.resourceType();
+    if (type === "image" || type === "font" || type === "media") {
+      void req.abort();
+      return;
+    }
+    const u = req.url();
+    if (BLOCK_URL_PARTS.some((p) => u.includes(p))) {
+      void req.abort();
+      return;
+    }
+    void req.continue();
+  });
 }
 
 async function scrapeOneProductDetail(page, productUrl) {
@@ -226,9 +335,15 @@ async function scrapeOneProductDetail(page, productUrl) {
     waitUntil: "domcontentloaded",
     timeout: 60_000,
   });
+  await page
+    .waitForSelector("#pdp_comp-product_content", { timeout: 30_000 })
+    .catch(() => {});
+
   await nudgePdpScroll(page);
   await page
-    .waitForSelector("#pdp_comp-product_content", { timeout: 45_000 })
+    .waitForSelector('[data-testid="lblPDPDescriptionProduk"]', {
+      timeout: 6000,
+    })
     .catch(() => {});
 
   const detail = await page.evaluate((ratingScale) => {
@@ -291,26 +406,73 @@ async function scrapeOneProductDetail(page, productUrl) {
   return detail;
 }
 
-async function enrichWithProductDetails(browser, urls) {
-  const page = await browser.newPage();
-  await page.setUserAgent(chromeUserAgent);
-  await page.setViewport({ width: 1280, height: 800 });
-  const products = [];
+async function enrichWithProductDetails(browser, urls, concurrency) {
+  const results = new Array(urls.length);
+  let cursor = 0;
 
-  try {
-    for (let i = 0; i < urls.length; i++) {
-      const url = urls[i];
-      const detail = await scrapeOneProductDetail(page, url);
-      products.push({ url, detail });
-      if (i < urls.length - 1) {
-        await new Promise((r) => setTimeout(r, 400));
-      }
-    }
-  } finally {
-    await page.close();
+  function claimIndex() {
+    if (cursor >= urls.length) return -1;
+    return cursor++;
   }
 
-  return products;
+  async function worker() {
+    const page = await browser.newPage();
+    await page.setUserAgent(chromeUserAgent);
+    await page.setViewport({ width: 1280, height: 800 });
+    await attachDetailPageOptimizations(page);
+    try {
+      for (;;) {
+        const i = claimIndex();
+        if (i < 0) break;
+        const url = urls[i];
+        const detail = await scrapeOneProductDetail(page, url);
+        results[i] = { url, detail };
+      }
+    } finally {
+      await page.close();
+    }
+  }
+
+  const workers = Math.min(concurrency, Math.max(1, urls.length));
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+  return results;
+}
+
+function printResult(payload) {
+  if (OUTPUT_FORMAT === "csv") {
+    if (payload.showDetail) {
+      const header = [
+        "url",
+        "name",
+        "description",
+        "imageLink",
+        "price",
+        "rating",
+        "ratingOutOf",
+        "merchantName",
+      ];
+      const rows = [header];
+      for (const { url, detail } of payload.products) {
+        rows.push([
+          url,
+          detail.name,
+          detail.description,
+          detail.imageLink,
+          detail.price,
+          detail.rating,
+          detail.ratingOutOf,
+          detail.merchantName,
+        ]);
+      }
+      writeOutput(`\uFEFF${toCsvLines(rows)}\n`);
+    } else {
+      const rows = [["url"], ...payload.productUrls.map((u) => [u])];
+      writeOutput(`\uFEFF${toCsvLines(rows)}\n`);
+    }
+    return;
+  }
+
+  writeOutput(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
 async function main() {
@@ -323,36 +485,29 @@ async function main() {
     const { urls, pagesOpened } = await scrapeTopProductUrls(browser);
 
     if (SHOW_DETAIL) {
-      const products = await enrichWithProductDetails(browser, urls);
-      console.log(
-        JSON.stringify(
-          {
-            categoryUrl,
-            maxProducts: MAX_PRODUCTS,
-            count: urls.length,
-            pagesOpened,
-            showDetail: true,
-            products,
-          },
-          null,
-          2,
-        ),
+      const products = await enrichWithProductDetails(
+        browser,
+        urls,
+        DETAIL_CONCURRENCY,
       );
+      printResult({
+        categoryUrl,
+        maxProducts: MAX_PRODUCTS,
+        count: urls.length,
+        pagesOpened,
+        showDetail: true,
+        detailConcurrency: DETAIL_CONCURRENCY,
+        products,
+      });
     } else {
-      console.log(
-        JSON.stringify(
-          {
-            categoryUrl,
-            maxProducts: MAX_PRODUCTS,
-            count: urls.length,
-            pagesOpened,
-            showDetail: false,
-            productUrls: urls,
-          },
-          null,
-          2,
-        ),
-      );
+      printResult({
+        categoryUrl,
+        maxProducts: MAX_PRODUCTS,
+        count: urls.length,
+        pagesOpened,
+        showDetail: false,
+        productUrls: urls,
+      });
     }
   } finally {
     await browser.close();
